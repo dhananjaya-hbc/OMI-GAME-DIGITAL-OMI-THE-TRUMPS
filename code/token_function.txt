@@ -1,0 +1,510 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <SevSeg.h>
+
+// WiFi credentials - CHANGE THESE TO YOUR NETWORK
+const char* ssid = "Mihiran4G";
+const char* password = "Kavinda@12345";
+
+// TCP Server on port 8080
+WiFiServer server(8080);
+WiFiClient client;
+
+// Connection management variables
+unsigned long lastClientCheck = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastWiFiCheck = 0;
+bool clientWasConnected = false;
+
+// RFID pins (adjust according to your wiring)
+#define SS_PIN 10
+#define RST_PIN 9
+#define SCK_PIN 12
+#define MISO_PIN 13
+#define MOSI_PIN 11
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// RFID card IDs - REPLACE WITH YOUR ACTUAL CARD UIDs
+byte teamACard[4] = {0x03, 0xB4, 0x80, 0x0E}; // Team A card UID
+byte teamBCard[4] = {0xA3, 0x5A, 0x7F, 0x0E}; // Team B card UID
+
+// Seven-segment displays (adjust pins according to your wiring)
+SevSeg sevsegA;
+SevSeg sevsegB;
+
+// Game variables
+int teamATokens = 10;
+int teamBTokens = 10;
+String currentTeam = "";
+int scansRequired = 0;
+int scansCompleted = 0;
+bool scanning = false;
+unsigned long lastScanTime = 0;
+const int scanDelay = 2000;  // CHANGED: Increased from 1000ms to 2000ms (2 seconds)
+
+// Status LEDs (optional)
+#define WIFI_LED_PIN 2    // Built-in LED for WiFi status
+#define CLIENT_LED_PIN 4  // Optional external LED for client status
+
+// BRIGHTNESS OPTIMIZATION VARIABLES
+unsigned long lastDisplayUpdate = 0;
+const int DISPLAY_UPDATE_INTERVAL = 2; // Update every 2ms for maximum brightness
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("=================================");
+  Serial.println("ESP32 Token Manager Starting...");
+  Serial.println("=================================");
+  
+  // Initialize status LEDs
+  pinMode(WIFI_LED_PIN, OUTPUT);
+  pinMode(CLIENT_LED_PIN, OUTPUT);
+  digitalWrite(WIFI_LED_PIN, LOW);
+  digitalWrite(CLIENT_LED_PIN, LOW);
+  
+  // Optional: Configure static IP (uncomment and adjust if needed)
+  /*
+  IPAddress local_IP(192, 168, 187, 100);  // Set your desired static IP
+  IPAddress gateway(192, 168, 187, 1);     // Your router IP
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress primaryDNS(8, 8, 8, 8);
+  
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+    Serial.println("Static IP configuration failed");
+  }
+  */
+  
+  // Initialize WiFi
+  initializeWiFi();
+  
+  // Start TCP server
+  server.begin();
+  server.setNoDelay(true);
+  Serial.println("TCP Server started on port 8080");
+  Serial.println("Waiting for Raspberry Pi connection...");
+  
+  // Initialize SPI and RFID
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  rfid.PCD_Init();
+  
+  // Test RFID initialization
+  byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+  if (version == 0x00 || version == 0xFF) {
+    Serial.println("WARNING: RFID reader not found or not working properly");
+  } else {
+    Serial.print("RFID reader detected, version: 0x");
+    Serial.println(version, HEX);
+  }
+  
+  // Initialize seven-segment displays
+  initializeDisplays();
+  
+  // Display initial tokens
+  sevsegA.setNumber(teamATokens);
+  sevsegB.setNumber(teamBTokens);
+  
+  Serial.println("=================================");
+  Serial.println("ESP32 Token Manager Ready!");
+  Serial.println("Team A Tokens: 10");
+  Serial.println("Team B Tokens: 10");
+  Serial.print("Server IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("=================================");
+}
+
+void initializeWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
+  WiFi.setHostname("ESP32-TokenManager");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected successfully!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    digitalWrite(WIFI_LED_PIN, HIGH);
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi!");
+    Serial.println("Please check your credentials and try again");
+  }
+}
+
+void initializeDisplays() {
+  byte numDigits = 2;
+  
+  // Team A display configuration
+  byte digitPinsA[] = {8, 3};
+  byte segmentPinsA[] = {4, 5, 6, 7, 15, 16, 17, 18};
+  
+  // Team B display configuration  
+  byte digitPinsB[] = {37, 14};
+  byte segmentPinsB[] = {1, 2, 21, 47, 48, 45, 35, 36};
+  
+  sevsegA.begin(COMMON_CATHODE, numDigits, digitPinsA, segmentPinsA, true, true, false);
+  sevsegB.begin(COMMON_CATHODE, numDigits, digitPinsB, segmentPinsB, true, true, false);
+  
+  Serial.println("Seven-segment displays initialized with MAXIMUM software brightness optimization");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // MAXIMUM BRIGHTNESS OPTIMIZATION - Continuous high-frequency refresh
+  optimizedDisplayRefresh();
+  
+  // Time-based operations to prevent blocking the display refresh
+  if (currentTime - lastWiFiCheck > 10000) {
+    checkWiFiConnection();
+    lastWiFiCheck = currentTime;
+  }
+  
+  // Handle client connections with minimal blocking
+  handleClientConnection();
+  
+  // Send periodic heartbeat if client is connected
+  if (client && client.connected()) {
+    if (currentTime - lastHeartbeat > 15000) {
+      sendHeartbeat();
+      lastHeartbeat = currentTime;
+    }
+  }
+  
+  // Handle RFID scanning if active
+  if (scanning && scansCompleted < scansRequired) {
+    handleRFIDScanning();
+  }
+  
+  // Absolutely minimal delay - maximum refresh rate
+  delayMicroseconds(100);
+}
+
+// OPTIMIZED DISPLAY REFRESH FUNCTION FOR MAXIMUM BRIGHTNESS
+void optimizedDisplayRefresh() {
+  // Ultra-high frequency refresh for maximum brightness
+  for(int cycle = 0; cycle < 8; cycle++) {
+    sevsegA.refreshDisplay();
+    sevsegB.refreshDisplay();
+    
+    // Micro-delays for optimal timing
+    delayMicroseconds(25);
+    
+    sevsegA.refreshDisplay();
+    sevsegB.refreshDisplay();
+    
+    delayMicroseconds(25);
+  }
+}
+
+void handleClientConnection() {
+  static WiFiClient persistentClient;
+  static unsigned long lastConnectionCheck = 0;
+  static bool clientInitialized = false;
+  
+  unsigned long currentTime = millis();
+  
+  // Reduced check frequency to maximize display refresh time
+  if (currentTime - lastConnectionCheck < 1000) {
+    return;
+  }
+  lastConnectionCheck = currentTime;
+  
+  if (persistentClient && persistentClient.connected()) {
+    client = persistentClient;
+    
+    if (!clientInitialized) {
+      Serial.println("Client connection established and stable");
+      clientWasConnected = true;
+      digitalWrite(CLIENT_LED_PIN, HIGH);
+      client.println("ESP32_READY");
+      client.flush();
+      clientInitialized = true;
+      lastHeartbeat = currentTime;
+    }
+    
+    if (client.available()) {
+      processIncomingData();
+    }
+  } else {
+    if (clientWasConnected) {
+      Serial.println("Client disconnected");
+      clientWasConnected = false;
+      clientInitialized = false;
+      digitalWrite(CLIENT_LED_PIN, LOW);
+    }
+    
+    WiFiClient newClient = server.available();
+    if (newClient) {
+      if (persistentClient) {
+        persistentClient.stop();
+      }
+      
+      persistentClient = newClient;
+      persistentClient.setTimeout(30000);
+      
+      Serial.println("New client attempting connection...");
+      Serial.print("Client IP: ");
+      Serial.println(persistentClient.remoteIP());
+      
+      clientInitialized = false;
+    }
+  }
+}
+
+void processIncomingData() {
+  String command = "";
+  unsigned long startTime = millis();
+  
+  while (client.available() && (millis() - startTime < 2000)) {
+    char c = client.read();
+    if (c == '\n' || c == '\r') {
+      break;
+    }
+    command += c;
+    
+    if (command.length() > 100) {
+      Serial.println("Command too long, discarding");
+      return;
+    }
+  }
+  
+  command.trim();
+  if (command.length() > 0) {
+    Serial.println("Received command: " + command);
+    processCommand(command);
+  }
+}
+
+void processCommand(String command) {
+  if (command.startsWith("START_SCAN:")) {
+    handleStartScanCommand(command);
+  }
+  else if (command == "GET_TOKENS") {
+    handleGetTokensCommand();
+  }
+  else if (command == "RESET_TOKENS") {
+    handleResetTokensCommand();
+  }
+  else if (command == "PING") {
+    handlePingCommand();
+  }
+  else if (command == "STATUS") {
+    handleStatusCommand();
+  }
+  else {
+    Serial.println("Unknown command: " + command);
+    sendToClient("ERROR:UNKNOWN_COMMAND");
+  }
+}
+
+void handleStartScanCommand(String command) {
+  int firstColon = command.indexOf(':');
+  int secondColon = command.indexOf(':', firstColon + 1);
+  
+  if (firstColon > 0 && secondColon > 0) {
+    currentTeam = command.substring(firstColon + 1, secondColon);
+    scansRequired = command.substring(secondColon + 1).toInt();
+    
+    if ((currentTeam != "A" && currentTeam != "B") || scansRequired <= 0 || scansRequired > 10) {
+      Serial.println("Invalid scan parameters");
+      sendToClient("ERROR:INVALID_PARAMETERS");
+      return;
+    }
+    
+    int teamTokens = (currentTeam == "A") ? teamATokens : teamBTokens;
+    if (teamTokens < scansRequired) {
+      Serial.println("Not enough tokens for team " + currentTeam);
+      sendToClient("ERROR:NOT_ENOUGH_TOKENS");
+      return;
+    }
+    
+    scansCompleted = 0;
+    scanning = true;
+    
+    Serial.println("Starting scan session:");
+    Serial.println("  Team: " + currentTeam);
+    Serial.println("  Scans required: " + String(scansRequired));
+    Serial.println("  Team tokens available: " + String(teamTokens));
+    
+    sendToClient("SCAN_READY:" + currentTeam + ":" + String(scansRequired));
+  } else {
+    Serial.println("Invalid command format");
+    sendToClient("ERROR:INVALID_FORMAT");
+  }
+}
+
+void handleGetTokensCommand() {
+  String response = "TOKENS:A:" + String(teamATokens) + ":B:" + String(teamBTokens);
+  sendToClient(response);
+}
+
+void handleResetTokensCommand() {
+  teamATokens = 10;
+  teamBTokens = 10;
+  sevsegA.setNumber(teamATokens);
+  sevsegB.setNumber(teamBTokens);
+  
+  scanning = false;
+  scansRequired = 0;
+  scansCompleted = 0;
+  currentTeam = "";
+  
+  Serial.println("Tokens reset to 10 each");
+  sendToClient("TOKENS_RESET:SUCCESS");
+}
+
+void handlePingCommand() {
+  sendToClient("PONG");
+}
+
+void handleStatusCommand() {
+  String status = "STATUS:";
+  status += "WIFI:" + String(WiFi.status()) + ":";
+  status += "RSSI:" + String(WiFi.RSSI()) + ":";
+  status += "TOKENS_A:" + String(teamATokens) + ":";
+  status += "TOKENS_B:" + String(teamBTokens) + ":";
+  status += "SCANNING:" + String(scanning ? "TRUE" : "FALSE");
+  
+  sendToClient(status);
+}
+
+void sendToClient(String message) {
+  if (client && client.connected()) {
+    client.println(message);
+    client.flush();
+    if (message != "HEARTBEAT") {
+      Serial.println("Sent: " + message);
+    }
+  } else {
+    Serial.println("Cannot send - client not connected: " + message);
+  }
+}
+
+void sendHeartbeat() {
+  sendToClient("HEARTBEAT");
+}
+
+void handleRFIDScanning() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastScanTime < scanDelay) return;  // Now uses 2000ms (2 seconds)
+  
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+  
+  bool validScan = false;
+  String scanResult = "";
+  
+  Serial.print("Card scanned - UID: ");
+  for (int i = 0; i < 4; i++) {
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    if (i < 3) Serial.print(" ");
+  }
+  Serial.println();
+  
+  if (currentTeam == "A" && memcmp(rfid.uid.uidByte, teamACard, 4) == 0) {
+    if (teamATokens > 0) {
+      teamATokens--;
+      sevsegA.setNumber(teamATokens);
+      validScan = true;
+      scanResult = "VALID_SCAN_A";
+      Serial.println("Valid scan for Team A - tokens left: " + String(teamATokens));
+    } else {
+      scanResult = "NO_TOKENS_A";
+      Serial.println("Team A has no tokens left");
+    }
+  }
+  else if (currentTeam == "B" && memcmp(rfid.uid.uidByte, teamBCard, 4) == 0) {
+    if (teamBTokens > 0) {
+      teamBTokens--;
+      sevsegB.setNumber(teamBTokens);
+      validScan = true;
+      scanResult = "VALID_SCAN_B";
+      Serial.println("Valid scan for Team B - tokens left: " + String(teamBTokens));
+    } else {
+      scanResult = "NO_TOKENS_B";
+      Serial.println("Team B has no tokens left");
+    }
+  } else {
+    scanResult = "WRONG_CARD";
+    Serial.println("Wrong card scanned for Team " + currentTeam);
+  }
+  
+  if (validScan) {
+    scansCompleted++;
+    lastScanTime = currentTime;
+    
+    Serial.println("Scan progress: " + String(scansCompleted) + "/" + String(scansRequired));
+    
+    String progressMsg = "SCAN_PROGRESS:" + currentTeam + ":" + 
+                        String(scansCompleted) + ":" + String(scansRequired) + ":" +
+                        String(teamATokens) + ":" + String(teamBTokens);
+    sendToClient(progressMsg);
+    
+    if (scansCompleted >= scansRequired) {
+      scanning = false;
+      Serial.println("Scan session completed for Team " + currentTeam);
+      sendToClient("SCAN_COMPLETE:" + currentTeam);
+    }
+  } else {
+    Serial.println("Invalid scan: " + scanResult);
+    sendToClient("SCAN_ERROR:" + scanResult);
+  }
+  
+  if (teamATokens == 0) {
+    Serial.println("GAME OVER: Team B Wins! (Team A out of tokens)");
+    sendToClient("GAME_OVER:B_WINS");
+  } else if (teamBTokens == 0) {
+    Serial.println("GAME OVER: Team A Wins! (Team B out of tokens)");
+    sendToClient("GAME_OVER:A_WINS");
+  }
+  
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection lost! Reconnecting...");
+    digitalWrite(WIFI_LED_PIN, LOW);
+    
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 15) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      digitalWrite(WIFI_LED_PIN, HIGH);
+    } else {
+      Serial.println("\nFailed to reconnect to WiFi");
+    }
+  } else {
+    digitalWrite(WIFI_LED_PIN, HIGH);
+  }
+}
